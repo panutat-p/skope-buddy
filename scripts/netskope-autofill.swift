@@ -386,17 +386,20 @@ private func waitThenRunStep3(_ step3: Step) -> Bool {
 /// appropriate for rare re-auth (≈2×/day, ~6h sessions).
 private func waitForStep1(_ step1: Step) {
     log("idle — sleeping until Netskope re-authenticate appears (wake on window event, safety poll \(Int(idleSafetyPollSeconds))s)")
+    MenuBarStatus.shared.set(.idle)
     let wake = NetskopeWakeSource.shared
 
     while true {
         if tryRunStep1IfReady(step1) { return }
 
+        MenuBarStatus.shared.set(.idle)
         let wokeFromEvent = wake.wait(timeout: idleSafetyPollSeconds)
         if tryRunStep1IfReady(step1) { return }
 
         guard wokeFromEvent else { continue }
 
         // Webview often populates after the window event — burst-poll briefly.
+        MenuBarStatus.shared.set(.watching)
         let burstDeadline = Date().addingTimeInterval(activeBurstSeconds)
         while Date() < burstDeadline {
             if tryRunStep1IfReady(step1) { return }
@@ -407,6 +410,7 @@ private func waitForStep1(_ step1: Step) {
 
 private func tryRunStep1IfReady(_ step1: Step) -> Bool {
     guard step1PageReady() else { return false }
+    MenuBarStatus.shared.set(.watching)
     log("step 1 page ready")
     Thread.sleep(forTimeInterval: 0.4)
     runStep(step1)
@@ -417,6 +421,7 @@ private func tryRunStep1IfReady(_ step1: Step) -> Bool {
 /// step's page never appeared (nothing typed blind).
 private func runSequenceOnce(step1: Step, step2: Step, step3: Step) -> Bool {
     waitForStep1(step1)
+    MenuBarStatus.shared.set(.watching)
     Thread.sleep(forTimeInterval: 1.5)
     guard waitThenRunStep2(step2) else { return false }
     return waitThenRunStep3(step3)
@@ -433,6 +438,7 @@ private func watchSequence(step1: Step, step2: Step, step3: Step) -> Never {
         } else {
             log("sequence incomplete; cooling down \(Int(sequenceCooldownSeconds))s before idle again")
         }
+        MenuBarStatus.shared.set(.idle)
         Thread.sleep(forTimeInterval: sequenceCooldownSeconds)
     }
 }
@@ -569,20 +575,65 @@ private func axObserverCallback(
 
 // MARK: - Menu bar indicator
 
+/// Idle (outline bolt) while sleeping; watching (filled bolt) during burst poll / autofill.
+private final class MenuBarStatus {
+    enum State {
+        case idle
+        case watching
+    }
+
+    static let shared = MenuBarStatus()
+
+    private var statusItem: NSStatusItem?
+    private var state: State = .idle
+
+    func attach(_ item: NSStatusItem) {
+        precondition(Thread.isMainThread)
+        statusItem = item
+        apply(state)
+    }
+
+    func set(_ newState: State) {
+        let applyOnMain = { [weak self] in
+            guard let self else { return }
+            guard self.state != newState else { return }
+            self.state = newState
+            self.apply(newState)
+        }
+        if Thread.isMainThread {
+            applyOnMain()
+        } else {
+            DispatchQueue.main.async(execute: applyOnMain)
+        }
+    }
+
+    private func apply(_ state: State) {
+        guard let button = statusItem?.button else { return }
+        switch state {
+        case .idle:
+            button.image = NSImage(
+                systemSymbolName: "bolt",
+                accessibilityDescription: "Skope Buddy idle"
+            )
+            button.toolTip = "Skope Buddy — idle"
+        case .watching:
+            button.image = NSImage(
+                systemSymbolName: "bolt.fill",
+                accessibilityDescription: "Skope Buddy watching"
+            )
+            button.toolTip = "Skope Buddy — watching"
+        }
+        button.image?.isTemplate = true
+    }
+}
+
 /// Standing menu-bar accessory for the process lifetime.
 private func runWithMenuBarIcon(_ work: @escaping () -> Int32) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory) // no Dock icon
 
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    if let button = statusItem.button {
-        button.image = NSImage(
-            systemSymbolName: "bolt.fill",
-            accessibilityDescription: "Skope Buddy watching for Netskope re-authenticate"
-        )
-        button.image?.isTemplate = true
-        button.toolTip = "Skope Buddy — idle until re-authenticate"
-    }
+    MenuBarStatus.shared.attach(statusItem)
 
     let menu = NSMenu()
     let quit = NSMenuItem(

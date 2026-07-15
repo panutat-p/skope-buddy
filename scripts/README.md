@@ -2,7 +2,7 @@
 
 ## netskope-autofill.swift
 
-Native Swift CLI (AX API + CGEvents, no external dependencies). A standing watcher with a menu-bar icon for the process lifetime. Credentials come only from project-root `.env`.
+Native Swift CLI (AX API + CGEvents, no external dependencies). A standing watcher with a two-state menu-bar icon (outline bolt = idle, filled bolt = watching) for the process lifetime. Credentials come only from project-root `.env`.
 
 ### Setup
 
