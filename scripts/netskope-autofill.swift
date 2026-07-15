@@ -554,12 +554,12 @@ private func validateInputs(_ args: Args) -> Bool {
     }
     if args.command == "step2" || args.command == "sequence" {
         if args.email2.isEmpty || args.email2 == placeholderEmail2 {
-            problems.append("email2 is empty or still the placeholder (\(placeholderEmail2)) — set KKPS_EMAIL in .env or pass --email2")
+            problems.append("email2 is empty or still the placeholder (\(placeholderEmail2)) — set CORPORATE_EMAIL in .env or pass --email2")
         }
     }
     if args.command == "step3" || args.command == "sequence" {
         if args.password.isEmpty {
-            problems.append("password is empty — set KKPS_PASSWORD in .env or pass --password")
+            problems.append("password is empty — set CORPORATE_PASSWORD in .env or pass --password")
         }
     }
     for p in problems { log(p) }
@@ -570,9 +570,9 @@ private func parseArgs(dotEnv: [String: String]) -> Args {
     var args = Args()
     args.email1 = envValue("NETSKOPE_EMAIL", file: dotEnv,
                            fallback: envValue("NETSKOPE_EMAIL1", file: dotEnv, fallback: args.email1))
-    args.email2 = envValue("KKPS_EMAIL", file: dotEnv,
+    args.email2 = envValue("CORPORATE_EMAIL", file: dotEnv,
                            fallback: envValue("NETSKOPE_EMAIL2", file: dotEnv, fallback: args.email2))
-    args.password = envValue("KKPS_PASSWORD", file: dotEnv)
+    args.password = envValue("CORPORATE_PASSWORD", file: dotEnv)
 
     let argv = Array(CommandLine.arguments.dropFirst())
     var i = 0
@@ -598,9 +598,9 @@ private func parseArgs(dotEnv: [String: String]) -> Args {
             Usage: netskope-autofill.swift <sequence|step1|step2|step3|dump|env> [--email1 E] [--email2 E] [--password P]
 
             Loads project-root .env:
-              NETSKOPE_EMAIL   first page (Netskope)
-              KKPS_EMAIL       second page (Microsoft / KKPS)
-              KKPS_PASSWORD    third page (password) — stored in plaintext .env; not committed (.gitignore)
+              NETSKOPE_EMAIL     first page (Netskope)
+              CORPORATE_EMAIL    second page (Microsoft / corporate)
+              CORPORATE_PASSWORD third page (password) — stored in plaintext .env; not committed (.gitignore)
             CLI flags override .env / environment.
 
             step1 / sequence wait indefinitely for the Netskope window to appear before
@@ -629,8 +629,8 @@ private func main() {
 
     let args = parseArgs(dotEnv: loaded.values)
     log("NETSKOPE_EMAIL=\(args.email1)")
-    log("KKPS_EMAIL=\(args.email2)")
-    log("KKPS_PASSWORD=\(args.password.isEmpty ? "(empty)" : "(set)")")
+    log("CORPORATE_EMAIL=\(args.email2)")
+    log("CORPORATE_PASSWORD=\(args.password.isEmpty ? "(empty)" : "(set)")")
 
     if args.command != "env" {
         requireAccessibility()

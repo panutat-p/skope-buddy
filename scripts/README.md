@@ -33,8 +33,8 @@ Values load from project-root `.env` (gitignored):
 | Variable | Page |
 |----------|------|
 | `NETSKOPE_EMAIL` | First (Netskope) |
-| `KKPS_EMAIL` | Second (Microsoft / KKPS) |
-| `KKPS_PASSWORD` | Third (password) — stored and typed in plaintext; see caveat below |
+| `CORPORATE_EMAIL` | Second (Microsoft / corporate) |
+| `CORPORATE_PASSWORD` | Third (password) — stored and typed in plaintext; see caveat below |
 
 CLI `--email1` / `--email2` / `--password` override `.env`. `env` just prints what was loaded (no Accessibility needed, and the password value itself is never printed — only `(set)`/`(empty)`).
 
@@ -45,9 +45,9 @@ CLI `--email1` / `--email2` / `--password` override `.env`. `env` just prints wh
   - `step2` and the sequence's step 2 wait up to 20s for the Microsoft page; `step3` / step 3 wait up to 20s for the password page.
   - If the target page never appears, the script aborts (exit 1) instead of typing into whatever page is showing — nothing is typed blind.
 - `step1` / `step2` / `sequence` refuse to run if the relevant email is still the built-in placeholder (`you@kkpfg.com` / `you@phatrasec.com`) or empty — set `.env` or pass `--email1`/`--email2` first.
-- `step3` / `sequence` refuse to run if `KKPS_PASSWORD` is empty — set `.env` or pass `--password` first.
+- `step3` / `sequence` refuse to run if `CORPORATE_PASSWORD` is empty — set `.env` or pass `--password` first.
 - MFA approval, if prompted after step 3, is never automated — that stays manual.
 
 ### Caveat: plaintext password
 
-`KKPS_PASSWORD` is stored in `.env` as plaintext (matching the other credentials in that file) and typed into the Microsoft password field. `.env` is gitignored and never committed, but it is not encrypted at rest — anything with read access to this file/machine can read the password.
+`CORPORATE_PASSWORD` is stored in `.env` as plaintext (matching the other credentials in that file) and typed into the Microsoft password field. `.env` is gitignored and never committed, but it is not encrypted at rest — anything with read access to this file/machine can read the password.
