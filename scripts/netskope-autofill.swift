@@ -575,11 +575,39 @@ private func axObserverCallback(
 
 // MARK: - Menu bar indicator
 
-/// Idle (outline bolt) while sleeping; watching (filled bolt) during burst poll / autofill.
+/// Idle = indigo moon.zzz; watching = yellow bolt (SF Symbol palette, not template).
 private final class MenuBarStatus {
     enum State {
         case idle
         case watching
+
+        var symbolName: String {
+            switch self {
+            case .idle: "moon.zzz.fill"
+            case .watching: "bolt.fill"
+            }
+        }
+
+        var paletteColor: NSColor {
+            switch self {
+            case .idle: .systemIndigo
+            case .watching: .systemYellow
+            }
+        }
+
+        var accessibilityDescription: String {
+            switch self {
+            case .idle: "Skope Buddy idle"
+            case .watching: "Skope Buddy watching"
+            }
+        }
+
+        var toolTip: String {
+            switch self {
+            case .idle: "Skope Buddy — idle"
+            case .watching: "Skope Buddy — watching"
+            }
+        }
     }
 
     static let shared = MenuBarStatus()
@@ -609,21 +637,25 @@ private final class MenuBarStatus {
 
     private func apply(_ state: State) {
         guard let button = statusItem?.button else { return }
-        switch state {
-        case .idle:
-            button.image = NSImage(
-                systemSymbolName: "bolt",
-                accessibilityDescription: "Skope Buddy idle"
-            )
-            button.toolTip = "Skope Buddy — idle"
-        case .watching:
-            button.image = NSImage(
-                systemSymbolName: "bolt.fill",
-                accessibilityDescription: "Skope Buddy watching"
-            )
-            button.toolTip = "Skope Buddy — watching"
-        }
-        button.image?.isTemplate = true
+        button.image = Self.makeImage(for: state)
+        button.toolTip = state.toolTip
+        // Palette-colored symbols must not be templates or the menu bar
+        // flattens them to monochrome.
+        button.image?.isTemplate = false
+        button.contentTintColor = nil
+    }
+
+    private static func makeImage(for state: State) -> NSImage? {
+        guard let symbol = NSImage(
+            systemSymbolName: state.symbolName,
+            accessibilityDescription: state.accessibilityDescription
+        ) else { return nil }
+
+        let sizeConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        let colorConfig = NSImage.SymbolConfiguration(paletteColors: [state.paletteColor])
+        return symbol
+            .withSymbolConfiguration(sizeConfig)?
+            .withSymbolConfiguration(colorConfig)
     }
 }
 

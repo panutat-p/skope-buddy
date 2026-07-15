@@ -19,7 +19,7 @@ MFA approval stays manual, by design.
    ```
 
 2. Grant **Accessibility** to Terminal (or iTerm) in System Settings → Privacy & Security → Accessibility.
-3. Start the watcher (menu-bar bolt: outline = idle, filled = watching; process sleeps until a Netskope window event). Open **Re-authenticate Private Access** when it appears — fills, 30s cooldown, then idle again. Quit via the menu-bar icon or `Ctrl+C`:
+3. Start the watcher (menu-bar: indigo moon = idle, yellow bolt = watching; process sleeps until a Netskope window event). Open **Re-authenticate Private Access** when it appears — fills, 30s cooldown, then idle again. Quit via the menu-bar icon or `Ctrl+C`:
 
    ```bash
    ./scripts/netskope-autofill.swift
