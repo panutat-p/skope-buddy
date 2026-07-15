@@ -3,7 +3,7 @@
 Automates the Netskope Client re-authentication prompt on macOS, which requires three fields typed in sequence:
 
 1. **Netskope**
-2. **Microsoft
+2. **Microsoft**
 3. **Password**
 
 MFA approval stays manual, by design.
@@ -19,8 +19,8 @@ MFA approval stays manual, by design.
    ```
 
 2. Grant **Accessibility** to Terminal (or iTerm) in System Settings → Privacy & Security → Accessibility.
-3. Run the script, then open the Netskope **Re-authenticate Private Access** window whenever you're ready (the script waits for it indefinitely; `Ctrl+C` cancels):
+3. Start the watcher (menu-bar: indigo moon = idle, yellow bolt = watching; process sleeps until a Netskope window event). Open **Re-authenticate Private Access** when it appears — fills, 30s cooldown, then idle again. Quit via the menu-bar icon or `Ctrl+C`:
 
    ```bash
-   ./scripts/netskope-autofill.swift sequence
+   ./scripts/netskope-autofill.swift
    ```
