@@ -12,7 +12,7 @@ The current working tool ahead of the full app.
 
 - [x] Refuse to run with a placeholder/empty email — validate before typing into a real login page
 - [x] Abort step 2 (instead of typing blind) if the Microsoft page isn't detected within the 20s timeout; propagate a real exit code
-- [x] Add step 3 (password page → type `KKPS_PASSWORD` → AXPress "Sign in"), gated by the same validate-before-type guard; abort (don't type blind) if the password page isn't detected within 20s
+- [x] Add step 3 (password page → type `CORPORATE_PASSWORD` → AXPress "Sign in"), gated by the same validate-before-type guard; abort (don't type blind) if the password page isn't detected within 20s
 - [x] Poll for the step 1 page instead of a one-shot check, so the script can be started *before* Netskope is open; waits indefinitely (Ctrl+C to cancel). Standalone `step2`/`step3` now also wait for their page instead of firing once.
 - [x] Make step 1 detection distinctive (require the "Continue" button **and** a text field, not just any field) so it can't false-match the Microsoft/password pages and type email1 into the wrong page if started mid-flow
 - [ ] Re-find the "Continue" button inside the retry loop — the webview can re-render after typing, invalidating the `AXUIElement` captured before typing
