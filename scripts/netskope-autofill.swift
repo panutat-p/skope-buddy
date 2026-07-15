@@ -385,21 +385,26 @@ private func waitThenRunStep3(_ step3: Step) -> Bool {
 /// safety timeouts do a single cheap check. Avoids continuous AX walks —
 /// appropriate for rare re-auth (≈2×/day, ~6h sessions).
 private func waitForStep1(_ step1: Step) {
-    log("idle — sleeping until Netskope re-authenticate appears (wake on window event, safety poll \(Int(idleSafetyPollSeconds))s)")
-    MenuBarStatus.shared.set(.idle)
     let wake = NetskopeWakeSource.shared
 
     while true {
         if tryRunStep1IfReady(step1) { return }
 
-        MenuBarStatus.shared.set(.idle)
-        let wokeFromEvent = wake.wait(timeout: idleSafetyPollSeconds)
+        // Log idle only when we actually block. A pending startup poke must not
+        // print "idle — sleeping" and then return immediately.
+        let result = wake.wait(timeout: idleSafetyPollSeconds) {
+            log("idle — waiting for Netskope re-authenticate (wake on window event, safety poll \(Int(idleSafetyPollSeconds))s)")
+            MenuBarStatus.shared.set(.idle)
+        }
+
+        if result.fromEvent {
+            MenuBarStatus.shared.set(.watching)
+        }
         if tryRunStep1IfReady(step1) { return }
 
-        guard wokeFromEvent else { continue }
+        guard result.fromEvent else { continue }
 
         // Webview often populates after the window event — burst-poll briefly.
-        MenuBarStatus.shared.set(.watching)
         let burstDeadline = Date().addingTimeInterval(activeBurstSeconds)
         while Date() < burstDeadline {
             if tryRunStep1IfReady(step1) { return }
@@ -435,10 +440,11 @@ private func watchSequence(step1: Step, step2: Step, step3: Step) -> Never {
     while true {
         if runSequenceOnce(step1: step1, step2: step2, step3: step3) {
             log("sequence done; cooling down \(Int(sequenceCooldownSeconds))s before idle again")
+            MenuBarStatus.shared.set(.idle)
         } else {
             log("sequence incomplete; cooling down \(Int(sequenceCooldownSeconds))s before idle again")
+            MenuBarStatus.shared.set(.idle)
         }
-        MenuBarStatus.shared.set(.idle)
         Thread.sleep(forTimeInterval: sequenceCooldownSeconds)
     }
 }
@@ -448,6 +454,13 @@ private func watchSequence(step1: Step, step2: Step, step3: Step) -> Never {
 /// Blocks the watcher thread until Netskope may have shown a new window.
 /// Events run on the main run loop; the watcher sleeps on an NSCondition.
 private final class NetskopeWakeSource: NSObject {
+    struct WaitResult {
+        /// True if poke() caused the wake (worth a burst poll).
+        let fromEvent: Bool
+        /// True if this call blocked on the condition (vs consuming a pending poke).
+        let didSleep: Bool
+    }
+
     static let shared = NetskopeWakeSource()
 
     private let condition = NSCondition()
@@ -484,24 +497,37 @@ private final class NetskopeWakeSource: NSObject {
 
         attachAXObserverIfNeeded()
         if netskopeApp() != nil {
-            poke() // re-auth window may already be open
+            poke() // re-auth window may already be open — pending check, not idle sleep
         }
         log("idle wake source started (NSWorkspace + AX window events)")
     }
 
     /// Sleep until poke() or `timeout` elapses.
-    /// Returns `true` if an event signaled the wake (worth a burst poll).
+    /// `beforeSleep` runs only when this call will actually block (not when a
+    /// poke is already pending, e.g. startup with Netskope already running).
     @discardableResult
-    func wait(timeout: TimeInterval) -> Bool {
+    func wait(timeout: TimeInterval, beforeSleep: (() -> Void)? = nil) -> WaitResult {
+        condition.lock()
+        if signaled {
+            signaled = false
+            condition.unlock()
+            return WaitResult(fromEvent: true, didSleep: false)
+        }
+        condition.unlock()
+
+        beforeSleep?()
+
         condition.lock()
         defer { condition.unlock() }
-        let hadSignal = signaled
-        if !signaled {
-            _ = condition.wait(until: Date().addingTimeInterval(timeout))
+        if signaled {
+            // Poked while beforeSleep ran — still didn't block.
+            signaled = false
+            return WaitResult(fromEvent: true, didSleep: false)
         }
-        let fromEvent = hadSignal || signaled
+        _ = condition.wait(until: Date().addingTimeInterval(timeout))
+        let fromEvent = signaled
         signaled = false
-        return fromEvent
+        return WaitResult(fromEvent: fromEvent, didSleep: true)
     }
 
     func poke() {
@@ -614,10 +640,13 @@ private final class MenuBarStatus {
 
     private var statusItem: NSStatusItem?
     private var state: State = .idle
+    private var images: [State: NSImage] = [:]
 
     func attach(_ item: NSStatusItem) {
         precondition(Thread.isMainThread)
         statusItem = item
+        images[.idle] = Self.makeImage(for: .idle)
+        images[.watching] = Self.makeImage(for: .watching)
         apply(state)
     }
 
@@ -631,13 +660,14 @@ private final class MenuBarStatus {
         if Thread.isMainThread {
             applyOnMain()
         } else {
-            DispatchQueue.main.async(execute: applyOnMain)
+            // Sync so the tray updates before the watcher continues AX work.
+            DispatchQueue.main.sync(execute: applyOnMain)
         }
     }
 
     private func apply(_ state: State) {
         guard let button = statusItem?.button else { return }
-        button.image = Self.makeImage(for: state)
+        button.image = images[state] ?? Self.makeImage(for: state)
         button.toolTip = state.toolTip
         // Palette-colored symbols must not be templates or the menu bar
         // flattens them to monochrome.
