@@ -12,13 +12,10 @@
  MFA approval, if prompted after step 3, stays manual — never automated here.
 
  Usage:
-   ./scripts/netskope-autofill.swift sequence --email1 you@kkpfg.com --email2 you@phatrasec.com --password P
-   ./scripts/netskope-autofill.swift step1 --email1 you@kkpfg.com
-   ./scripts/netskope-autofill.swift step2 --email2 you@phatrasec.com
-   ./scripts/netskope-autofill.swift step3 --password P
-   ./scripts/netskope-autofill.swift dump
+   ./scripts/netskope-autofill.swift
 
  Requires: System Settings → Privacy & Security → Accessibility → Terminal (or the runner).
+   Credentials from project-root .env (NETSKOPE_EMAIL, CORPORATE_EMAIL, CORPORATE_PASSWORD).
  */
 
 import AppKit
@@ -30,6 +27,15 @@ import Foundation
 
 private let appName = "Netskope Client"
 private let bundleID = "com.netskope.client.Netskope-Client"
+/// After a sequence attempt, suppress re-triggers long enough to absorb
+/// leftover window events and MFA (matches Phase 1 cooldown).
+private let sequenceCooldownSeconds: TimeInterval = 30
+/// How long to sleep between idle wake checks when no UI event arrives.
+/// Tuned for rare prompts (≈2×/day); AX work only runs after a wake.
+private let idleSafetyPollSeconds: TimeInterval = 60
+/// After a wake, poll briefly while the re-auth webview finishes loading.
+private let activeBurstSeconds: TimeInterval = 20
+private let activePollInterval: TimeInterval = 0.5
 
 private struct Step {
     let name: String
@@ -98,29 +104,6 @@ private func findElement(
         }
     }
     return nil
-}
-
-private func dumpTree(_ root: AXUIElement, depth: Int = 0, maxDepth: Int = 8) {
-    guard depth <= maxDepth else { return }
-    let indent = String(repeating: "  ", count: depth)
-    let role = axString(root, kAXRoleAttribute as String)
-    let title = axString(root, kAXTitleAttribute as String)
-    let desc = axString(root, kAXDescriptionAttribute as String)
-    let value = axString(root, kAXValueAttribute as String)
-    var parts = [role]
-    if !title.isEmpty { parts.append("title=\(title)") }
-    if !desc.isEmpty { parts.append("desc=\(desc)") }
-    if !value.isEmpty {
-        let clipped = value.count > 60 ? String(value.prefix(60)) + "…" : value
-        parts.append("value=\(clipped)")
-    }
-    if role == "AXButton" {
-        parts.append("enabled=\(axBool(root, kAXEnabledAttribute as String))")
-    }
-    print("\(indent)\(parts.joined(separator: " "))")
-    for child in axChildren(root) {
-        dumpTree(child, depth: depth + 1, maxDepth: maxDepth)
-    }
 }
 
 // MARK: - App / window
@@ -373,7 +356,7 @@ private func waitThenRunStep2(_ step2: Step) -> Bool {
             return true
         }
     }
-    log("Microsoft page not detected in 20s, aborting step 2 (rerun './scripts/netskope-autofill.swift step2' manually once it appears)")
+    log("Microsoft page not detected in 20s, aborting step 2")
     return false
 }
 
@@ -391,74 +374,235 @@ private func waitThenRunStep3(_ step3: Step) -> Bool {
             return true
         }
     }
-    log("Password page not detected in 20s, aborting step 3 (rerun './scripts/netskope-autofill.swift step3' manually once it appears)")
+    log("Password page not detected in 20s, aborting step 3")
     return false
 }
 
-/// Waits indefinitely for the step 1 page (Netskope window + email field) to
-/// appear, then runs step 1. This exists to cover "run the script, *then*
-/// open Netskope" — Ctrl+C cancels if you change your mind. Element-based,
-/// not a fixed sleep: it never types until the field is actually present.
+/// Waits until the step 1 page is present, then runs step 1.
+///
+/// Idle path sleeps until an NSWorkspace / AX window event (or a 60s safety
+/// timeout). Only event wakes get a short burst poll while the webview settles;
+/// safety timeouts do a single cheap check. Avoids continuous AX walks —
+/// appropriate for rare re-auth (≈2×/day, ~6h sessions).
 private func waitForStep1(_ step1: Step) {
-    log("waiting for Netskope step 1 page — open the Re-authenticate window now if it isn't already")
-    var elapsed = 0.0
+    log("idle — sleeping until Netskope re-authenticate appears (wake on window event, safety poll \(Int(idleSafetyPollSeconds))s)")
+    let wake = NetskopeWakeSource.shared
+
     while true {
-        if step1PageReady() {
-            log("step 1 page detected after \(String(format: "%.1f", elapsed))s")
-            Thread.sleep(forTimeInterval: 0.4)
-            runStep(step1)
-            return
+        if tryRunStep1IfReady(step1) { return }
+
+        let wokeFromEvent = wake.wait(timeout: idleSafetyPollSeconds)
+        if tryRunStep1IfReady(step1) { return }
+
+        guard wokeFromEvent else { continue }
+
+        // Webview often populates after the window event — burst-poll briefly.
+        let burstDeadline = Date().addingTimeInterval(activeBurstSeconds)
+        while Date() < burstDeadline {
+            if tryRunStep1IfReady(step1) { return }
+            Thread.sleep(forTimeInterval: activePollInterval)
         }
-        Thread.sleep(forTimeInterval: 0.3)
-        elapsed += 0.3
     }
 }
 
-private func runSequence(step1: Step, step2: Step, step3: Step) -> Bool {
+private func tryRunStep1IfReady(_ step1: Step) -> Bool {
+    guard step1PageReady() else { return false }
+    log("step 1 page ready")
+    Thread.sleep(forTimeInterval: 0.4)
+    runStep(step1)
+    return true
+}
+
+/// One pass: wait for step 1, then step 2 / step 3. Returns false if a later
+/// step's page never appeared (nothing typed blind).
+private func runSequenceOnce(step1: Step, step2: Step, step3: Step) -> Bool {
     waitForStep1(step1)
     Thread.sleep(forTimeInterval: 1.5)
     guard waitThenRunStep2(step2) else { return false }
     return waitThenRunStep3(step3)
 }
 
+/// Standing watcher: run the full sequence whenever the Netskope re-authenticate
+/// page appears, cool down, then sleep again. Never returns — stop with Ctrl+C
+/// or Quit from the menu-bar icon.
+private func watchSequence(step1: Step, step2: Step, step3: Step) -> Never {
+    log("watching for Netskope re-authenticate — Ctrl+C or Quit to stop")
+    while true {
+        if runSequenceOnce(step1: step1, step2: step2, step3: step3) {
+            log("sequence done; cooling down \(Int(sequenceCooldownSeconds))s before idle again")
+        } else {
+            log("sequence incomplete; cooling down \(Int(sequenceCooldownSeconds))s before idle again")
+        }
+        Thread.sleep(forTimeInterval: sequenceCooldownSeconds)
+    }
+}
+
+// MARK: - Idle wake source (NSWorkspace + AXObserver)
+
+/// Blocks the watcher thread until Netskope may have shown a new window.
+/// Events run on the main run loop; the watcher sleeps on an NSCondition.
+private final class NetskopeWakeSource: NSObject {
+    static let shared = NetskopeWakeSource()
+
+    private let condition = NSCondition()
+    private var signaled = false
+    private var axObserver: AXObserver?
+    private var observingPID: pid_t = 0
+    private var workspaceTokens: [NSObjectProtocol] = []
+    private var started = false
+
+    func start() {
+        precondition(Thread.isMainThread)
+        guard !started else { return }
+        started = true
+
+        let nc = NSWorkspace.shared.notificationCenter
+        workspaceTokens = [
+            nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.isNetskope(note) else { return }
+                log("Netskope Client launched — attaching window observer")
+                self.attachAXObserverIfNeeded()
+                self.poke()
+            },
+            nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.isNetskope(note) else { return }
+                self.attachAXObserverIfNeeded()
+                self.poke()
+            },
+            nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.isNetskope(note) else { return }
+                log("Netskope Client quit — detaching window observer")
+                self.detachAXObserver()
+            },
+        ]
+
+        attachAXObserverIfNeeded()
+        if netskopeApp() != nil {
+            poke() // re-auth window may already be open
+        }
+        log("idle wake source started (NSWorkspace + AX window events)")
+    }
+
+    /// Sleep until poke() or `timeout` elapses.
+    /// Returns `true` if an event signaled the wake (worth a burst poll).
+    @discardableResult
+    func wait(timeout: TimeInterval) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let hadSignal = signaled
+        if !signaled {
+            _ = condition.wait(until: Date().addingTimeInterval(timeout))
+        }
+        let fromEvent = hadSignal || signaled
+        signaled = false
+        return fromEvent
+    }
+
+    func poke() {
+        condition.lock()
+        signaled = true
+        condition.signal()
+        condition.unlock()
+    }
+
+    private func isNetskope(_ note: Notification) -> Bool {
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+            return false
+        }
+        return app.bundleIdentifier == bundleID || app.localizedName == appName
+    }
+
+    private func attachAXObserverIfNeeded() {
+        guard let app = netskopeApp() else {
+            detachAXObserver()
+            return
+        }
+        let pid = app.processIdentifier
+        if axObserver != nil, observingPID == pid { return }
+        detachAXObserver()
+
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        var observer: AXObserver?
+        guard AXObserverCreate(pid, axObserverCallback, &observer) == .success,
+              let observer else {
+            log("AXObserverCreate failed for pid=\(pid)")
+            return
+        }
+
+        let appEl = AXUIElementCreateApplication(pid)
+        let notifications = [
+            kAXWindowCreatedNotification as String,
+            kAXFocusedWindowChangedNotification as String,
+            kAXMainWindowChangedNotification as String,
+        ]
+        for name in notifications {
+            let err = AXObserverAddNotification(observer, appEl, name as CFString, refcon)
+            if err != .success && err != .notificationAlreadyRegistered {
+                log("AXObserverAddNotification(\(name)) failed: \(err.rawValue)")
+            }
+        }
+
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        axObserver = observer
+        observingPID = pid
+        log("AXObserver attached to Netskope pid=\(pid)")
+    }
+
+    private func detachAXObserver() {
+        if let observer = axObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        }
+        axObserver = nil
+        observingPID = 0
+    }
+}
+
+private func axObserverCallback(
+    _ observer: AXObserver,
+    _ element: AXUIElement,
+    _ notification: CFString,
+    _ refcon: UnsafeMutableRawPointer?
+) {
+    guard let refcon else { return }
+    Unmanaged<NetskopeWakeSource>.fromOpaque(refcon).takeUnretainedValue().poke()
+}
+
 // MARK: - Menu bar indicator
 
-/// Shows a plain status-bar icon for the duration of `work`, then exits with
-/// its return code. The icon is only visible while automation is actually
-/// running (step1/step2/step3/sequence) — it disappears the moment the
-/// process exits, since it's just a runtime indicator, not a standing app.
+/// Standing menu-bar accessory for the process lifetime.
 private func runWithMenuBarIcon(_ work: @escaping () -> Int32) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory) // no Dock icon
 
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     if let button = statusItem.button {
-        button.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Netskope autofill running")
+        button.image = NSImage(
+            systemSymbolName: "bolt.fill",
+            accessibilityDescription: "Skope Buddy watching for Netskope re-authenticate"
+        )
         button.image?.isTemplate = true
-        button.toolTip = "Netskope Autofill — running…"
+        button.toolTip = "Skope Buddy — idle until re-authenticate"
     }
 
-    DispatchQueue.global(qos: .userInitiated).async {
+    let menu = NSMenu()
+    let quit = NSMenuItem(
+        title: "Quit Skope Buddy",
+        action: #selector(NSApplication.terminate(_:)),
+        keyEquivalent: "q"
+    )
+    quit.target = app
+    menu.addItem(quit)
+    statusItem.menu = menu
+
+    NetskopeWakeSource.shared.start()
+
+    DispatchQueue.global(qos: .utility).async {
         let code = work()
         DispatchQueue.main.async { exit(code) }
     }
 
     app.run()
     exit(0)
-}
-
-private func dumpAX() {
-    guard let app = netskopeApp() else {
-        log("Netskope Client not running")
-        exit(1)
-    }
-    guard let window = focusedOrMainWindow(for: app) else {
-        log("no Netskope window")
-        exit(1)
-    }
-    let title = axString(window, kAXTitleAttribute as String)
-    print("=== Netskope window: \(title) pid=\(app.processIdentifier) ===")
-    dumpTree(window)
 }
 
 // MARK: - .env
@@ -531,90 +675,42 @@ private func envValue(_ key: String, file: [String: String], fallback: String = 
     return fallback
 }
 
-// MARK: - CLI
+// MARK: - Credentials
 
 private let placeholderEmail1 = "you@kkpfg.com"
 private let placeholderEmail2 = "you@phatrasec.com"
 
-private struct Args {
-    var command = "sequence"
-    var email1 = placeholderEmail1
-    var email2 = placeholderEmail2
-    var password = ""
+private struct Credentials {
+    var email1: String
+    var email2: String
+    var password: String
+}
+
+private func loadCredentials(dotEnv: [String: String]) -> Credentials {
+    Credentials(
+        email1: envValue("NETSKOPE_EMAIL", file: dotEnv,
+                         fallback: envValue("NETSKOPE_EMAIL1", file: dotEnv, fallback: placeholderEmail1)),
+        email2: envValue("CORPORATE_EMAIL", file: dotEnv,
+                         fallback: envValue("NETSKOPE_EMAIL2", file: dotEnv, fallback: placeholderEmail2)),
+        password: envValue("CORPORATE_PASSWORD", file: dotEnv)
+    )
 }
 
 /// Refuse to type placeholder/empty emails, or an empty password, into a real
-/// login page. Only checks the value(s) the given command will actually type.
-private func validateInputs(_ args: Args) -> Bool {
+/// login page.
+private func validateCredentials(_ creds: Credentials) -> Bool {
     var problems: [String] = []
-    if args.command == "step1" || args.command == "sequence" {
-        if args.email1.isEmpty || args.email1 == placeholderEmail1 {
-            problems.append("email1 is empty or still the placeholder (\(placeholderEmail1)) — set NETSKOPE_EMAIL in .env or pass --email1")
-        }
+    if creds.email1.isEmpty || creds.email1 == placeholderEmail1 {
+        problems.append("email1 is empty or still the placeholder (\(placeholderEmail1)) — set NETSKOPE_EMAIL in .env")
     }
-    if args.command == "step2" || args.command == "sequence" {
-        if args.email2.isEmpty || args.email2 == placeholderEmail2 {
-            problems.append("email2 is empty or still the placeholder (\(placeholderEmail2)) — set CORPORATE_EMAIL in .env or pass --email2")
-        }
+    if creds.email2.isEmpty || creds.email2 == placeholderEmail2 {
+        problems.append("email2 is empty or still the placeholder (\(placeholderEmail2)) — set CORPORATE_EMAIL in .env")
     }
-    if args.command == "step3" || args.command == "sequence" {
-        if args.password.isEmpty {
-            problems.append("password is empty — set CORPORATE_PASSWORD in .env or pass --password")
-        }
+    if creds.password.isEmpty {
+        problems.append("password is empty — set CORPORATE_PASSWORD in .env")
     }
     for p in problems { log(p) }
     return problems.isEmpty
-}
-
-private func parseArgs(dotEnv: [String: String]) -> Args {
-    var args = Args()
-    args.email1 = envValue("NETSKOPE_EMAIL", file: dotEnv,
-                           fallback: envValue("NETSKOPE_EMAIL1", file: dotEnv, fallback: args.email1))
-    args.email2 = envValue("CORPORATE_EMAIL", file: dotEnv,
-                           fallback: envValue("NETSKOPE_EMAIL2", file: dotEnv, fallback: args.email2))
-    args.password = envValue("CORPORATE_PASSWORD", file: dotEnv)
-
-    let argv = Array(CommandLine.arguments.dropFirst())
-    var i = 0
-    if let first = argv.first, !first.hasPrefix("-") {
-        args.command = first
-        i = 1
-    }
-    while i < argv.count {
-        let a = argv[i]
-        defer { i += 1 }
-        switch a {
-        case "--email1":
-            i += 1
-            if i < argv.count { args.email1 = argv[i] }
-        case "--email2":
-            i += 1
-            if i < argv.count { args.email2 = argv[i] }
-        case "--password":
-            i += 1
-            if i < argv.count { args.password = argv[i] }
-        case "-h", "--help":
-            print("""
-            Usage: netskope-autofill.swift <sequence|step1|step2|step3|dump|env> [--email1 E] [--email2 E] [--password P]
-
-            Loads project-root .env:
-              NETSKOPE_EMAIL     first page (Netskope)
-              CORPORATE_EMAIL    second page (Microsoft / corporate)
-              CORPORATE_PASSWORD third page (password) — stored in plaintext .env; not committed (.gitignore)
-            CLI flags override .env / environment.
-
-            step1 / sequence wait indefinitely for the Netskope window to appear before
-            typing, so you can start the script first and open Netskope afterward
-            (Ctrl+C to cancel).
-            Command `env` only prints loaded values (no Accessibility needed).
-            """)
-            exit(0)
-        default:
-            log("unknown argument: \(a)")
-            exit(2)
-        }
-    }
-    return args
 }
 
 // MARK: - Main
@@ -627,28 +723,27 @@ private func main() {
         log("no .env found (cwd=\(FileManager.default.currentDirectoryPath))")
     }
 
-    let args = parseArgs(dotEnv: loaded.values)
-    log("NETSKOPE_EMAIL=\(args.email1)")
-    log("CORPORATE_EMAIL=\(args.email2)")
-    log("CORPORATE_PASSWORD=\(args.password.isEmpty ? "(empty)" : "(set)")")
+    let creds = loadCredentials(dotEnv: loaded.values)
+    log("NETSKOPE_EMAIL=\(creds.email1)")
+    log("CORPORATE_EMAIL=\(creds.email2)")
+    log("CORPORATE_PASSWORD=\(creds.password.isEmpty ? "(empty)" : "(set)")")
 
-    if args.command != "env" {
-        requireAccessibility()
-    }
-    if ["step1", "step2", "step3", "sequence"].contains(args.command), !validateInputs(args) {
+    requireAccessibility()
+
+    if !validateCredentials(creds) {
         exit(1)
     }
 
     let step1 = Step(
         name: "step1",
-        value: args.email1,
+        value: creds.email1,
         buttonPattern: "continue",
         fieldX: 0.50, fieldY: 0.68,
         buttonX: 0.50, buttonY: 0.78
     )
     let step2 = Step(
         name: "step2",
-        value: args.email2,
+        value: creds.email2,
         buttonPattern: nil,
         fieldX: 0.50, fieldY: 0.24,
         buttonX: 0.50, buttonY: 0.50
@@ -658,48 +753,16 @@ private func main() {
     // fallback; AX-based discovery is primary and doesn't depend on them.
     let step3 = Step(
         name: "step3",
-        value: args.password,
+        value: creds.password,
         buttonPattern: "sign in",
         fieldX: 0.50, fieldY: 0.68,
         buttonX: 0.50, buttonY: 0.78
     )
 
-    switch args.command {
-    case "env":
-        // Already logged above; nothing else to do.
-        break
-    case "dump":
-        dumpAX()
-    case "step1", "step2", "step3", "sequence":
-        runWithMenuBarIcon {
-            switch args.command {
-            case "step1":
-                waitForStep1(step1)
-            case "step2":
-                if !waitThenRunStep2(step2) {
-                    log("failed")
-                    return 1
-                }
-            case "step3":
-                if !waitThenRunStep3(step3) {
-                    log("failed")
-                    return 1
-                }
-            default:
-                if !runSequence(step1: step1, step2: step2, step3: step3) {
-                    log("failed")
-                    return 1
-                }
-            }
-            log("done")
-            return 0
-        }
-    default:
-        log("unknown command: \(args.command) (use sequence|step1|step2|step3|dump|env)")
-        exit(2)
+    // Never returns — menu-bar icon stays up for the watcher lifetime.
+    runWithMenuBarIcon {
+        watchSequence(step1: step1, step2: step2, step3: step3)
     }
-
-    log("done")
 }
 
 main()
