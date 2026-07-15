@@ -2,15 +2,20 @@
 /**
  Netskope two-step email autofill (Swift CLI)
 
- Port of hammer_spoon/netskope-autofill.lua v7.
+ Native implementation: macOS Accessibility (AX) API for discovery/focus/press,
+ CGEvents posted to the Netskope process for keystrokes. No external dependencies.
 
-   Step 1: Netskope page  → email1 → AXPress "Continue"
-   Step 2: Microsoft page → email2 → Return
+   Step 1: Netskope page  → email1   → AXPress "Continue"
+   Step 2: Microsoft page → email2   → Return
+   Step 3: Password page  → password → AXPress "Sign in"
+
+ MFA approval, if prompted after step 3, stays manual — never automated here.
 
  Usage:
-   ./scripts/netskope-autofill.swift sequence --email1 you@kkpfg.com --email2 you@phatrasec.com
+   ./scripts/netskope-autofill.swift sequence --email1 you@kkpfg.com --email2 you@phatrasec.com --password P
    ./scripts/netskope-autofill.swift step1 --email1 you@kkpfg.com
    ./scripts/netskope-autofill.swift step2 --email2 you@phatrasec.com
+   ./scripts/netskope-autofill.swift step3 --password P
    ./scripts/netskope-autofill.swift dump
 
  Requires: System Settings → Privacy & Security → Accessibility → Terminal (or the runner).
@@ -28,7 +33,7 @@ private let bundleID = "com.netskope.client.Netskope-Client"
 
 private struct Step {
     let name: String
-    let email: String
+    let value: String
     let buttonPattern: String? // nil → submit with Return
     let fieldX: CGFloat
     let fieldY: CGFloat
@@ -267,8 +272,8 @@ private func runStep(_ step: Step) {
     // Cmd+A (virtual key 0 = 'a')
     postKey(pid: pid, keyCode: 0, flags: .maskCommand)
     Thread.sleep(forTimeInterval: 0.05)
-    typeText(step.email, to: pid)
-    log("\(step.name): typed email")
+    typeText(step.value, to: pid)
+    log("\(step.name): typed value")
 
     if step.useEnter {
         Thread.sleep(forTimeInterval: 0.6)
@@ -312,7 +317,51 @@ private func microsoftPageVisible() -> Bool {
     } != nil
 }
 
-private func waitThenRunStep2(_ step2: Step) {
+private func passwordPageVisible() -> Bool {
+    guard let app = netskopeApp(), let window = focusedOrMainWindow(for: app) else {
+        return false
+    }
+    return findElement(window) { el, role in
+        guard role == "AXTextField" || role == "AXStaticText" || role == "AXHeading" else { return false }
+        let v = (axString(el, kAXTitleAttribute as String) + " "
+            + axString(el, kAXDescriptionAttribute as String) + " "
+            + axString(el, kAXValueAttribute as String)).lowercased()
+        return v.contains("password")
+    } != nil
+}
+
+/// Step 1 is ready when the Netskope window exists *and* its webview shows the
+/// distinctive page-1 signature: an editable field **and** a "Continue" button.
+///
+/// We require the Continue button, not just any field, so this can't false-match
+/// the Microsoft (step 2) or password (step 3) pages — those also have input
+/// fields, and matching a field alone would let `step1` type email1 into the
+/// wrong page if the script were started mid-flow. `continue` is page 1's unique
+/// marker (FR-2). Both must be present because the webview populates
+/// asynchronously after the window appears — waiting on real elements rather
+/// than a fixed delay is what makes "start the script, then open Netskope" safe.
+private func step1PageReady() -> Bool {
+    guard let app = netskopeApp(), let window = focusedOrMainWindow(for: app) else {
+        return false
+    }
+    let hasField = findElement(window) { _, role in
+        role == "AXTextField" || role == "AXTextArea"
+    } != nil
+    guard hasField else { return false }
+
+    let hasContinue = findElement(window) { el, role in
+        guard role == "AXButton" else { return false }
+        let label = (axString(el, kAXTitleAttribute as String) + " "
+            + axString(el, kAXDescriptionAttribute as String)).lowercased()
+        return label.contains("continue")
+    } != nil
+    return hasContinue
+}
+
+/// Waits for the Microsoft page and runs step 2. Returns false (without typing
+/// anything) if the page never appeared — typing email2 into whatever page
+/// *is* showing after a timeout risks submitting it to the wrong form.
+private func waitThenRunStep2(_ step2: Step) -> Bool {
     var elapsed = 0.0
     while elapsed < 20.0 {
         Thread.sleep(forTimeInterval: 0.3)
@@ -321,18 +370,81 @@ private func waitThenRunStep2(_ step2: Step) {
             log("Microsoft page detected after \(String(format: "%.1f", elapsed))s")
             Thread.sleep(forTimeInterval: 0.4)
             runStep(step2)
-            return
+            return true
         }
     }
-    log("Microsoft page not detected in 20s, running step 2 anyway")
-    runStep(step2)
+    log("Microsoft page not detected in 20s, aborting step 2 (rerun './scripts/netskope-autofill.swift step2' manually once it appears)")
+    return false
 }
 
-private func runSequence(step1: Step, step2: Step) {
-    Thread.sleep(forTimeInterval: 1.0)
-    runStep(step1)
+/// Waits for the password page and runs step 3. Same reasoning as
+/// waitThenRunStep2: never type the password into an undetected page.
+private func waitThenRunStep3(_ step3: Step) -> Bool {
+    var elapsed = 0.0
+    while elapsed < 20.0 {
+        Thread.sleep(forTimeInterval: 0.3)
+        elapsed += 0.3
+        if passwordPageVisible() {
+            log("Password page detected after \(String(format: "%.1f", elapsed))s")
+            Thread.sleep(forTimeInterval: 0.4)
+            runStep(step3)
+            return true
+        }
+    }
+    log("Password page not detected in 20s, aborting step 3 (rerun './scripts/netskope-autofill.swift step3' manually once it appears)")
+    return false
+}
+
+/// Waits indefinitely for the step 1 page (Netskope window + email field) to
+/// appear, then runs step 1. This exists to cover "run the script, *then*
+/// open Netskope" — Ctrl+C cancels if you change your mind. Element-based,
+/// not a fixed sleep: it never types until the field is actually present.
+private func waitForStep1(_ step1: Step) {
+    log("waiting for Netskope step 1 page — open the Re-authenticate window now if it isn't already")
+    var elapsed = 0.0
+    while true {
+        if step1PageReady() {
+            log("step 1 page detected after \(String(format: "%.1f", elapsed))s")
+            Thread.sleep(forTimeInterval: 0.4)
+            runStep(step1)
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+        elapsed += 0.3
+    }
+}
+
+private func runSequence(step1: Step, step2: Step, step3: Step) -> Bool {
+    waitForStep1(step1)
     Thread.sleep(forTimeInterval: 1.5)
-    waitThenRunStep2(step2)
+    guard waitThenRunStep2(step2) else { return false }
+    return waitThenRunStep3(step3)
+}
+
+// MARK: - Menu bar indicator
+
+/// Shows a plain status-bar icon for the duration of `work`, then exits with
+/// its return code. The icon is only visible while automation is actually
+/// running (step1/step2/step3/sequence) — it disappears the moment the
+/// process exits, since it's just a runtime indicator, not a standing app.
+private func runWithMenuBarIcon(_ work: @escaping () -> Int32) -> Never {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory) // no Dock icon
+
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    if let button = statusItem.button {
+        button.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Netskope autofill running")
+        button.image?.isTemplate = true
+        button.toolTip = "Netskope Autofill — running…"
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        let code = work()
+        DispatchQueue.main.async { exit(code) }
+    }
+
+    app.run()
+    exit(0)
 }
 
 private func dumpAX() {
@@ -421,11 +533,37 @@ private func envValue(_ key: String, file: [String: String], fallback: String = 
 
 // MARK: - CLI
 
+private let placeholderEmail1 = "you@kkpfg.com"
+private let placeholderEmail2 = "you@phatrasec.com"
+
 private struct Args {
     var command = "sequence"
-    var email1 = "you@kkpfg.com"
-    var email2 = "you@phatrasec.com"
+    var email1 = placeholderEmail1
+    var email2 = placeholderEmail2
     var password = ""
+}
+
+/// Refuse to type placeholder/empty emails, or an empty password, into a real
+/// login page. Only checks the value(s) the given command will actually type.
+private func validateInputs(_ args: Args) -> Bool {
+    var problems: [String] = []
+    if args.command == "step1" || args.command == "sequence" {
+        if args.email1.isEmpty || args.email1 == placeholderEmail1 {
+            problems.append("email1 is empty or still the placeholder (\(placeholderEmail1)) — set NETSKOPE_EMAIL in .env or pass --email1")
+        }
+    }
+    if args.command == "step2" || args.command == "sequence" {
+        if args.email2.isEmpty || args.email2 == placeholderEmail2 {
+            problems.append("email2 is empty or still the placeholder (\(placeholderEmail2)) — set KKPS_EMAIL in .env or pass --email2")
+        }
+    }
+    if args.command == "step3" || args.command == "sequence" {
+        if args.password.isEmpty {
+            problems.append("password is empty — set KKPS_PASSWORD in .env or pass --password")
+        }
+    }
+    for p in problems { log(p) }
+    return problems.isEmpty
 }
 
 private func parseArgs(dotEnv: [String: String]) -> Args {
@@ -452,15 +590,22 @@ private func parseArgs(dotEnv: [String: String]) -> Args {
         case "--email2":
             i += 1
             if i < argv.count { args.email2 = argv[i] }
+        case "--password":
+            i += 1
+            if i < argv.count { args.password = argv[i] }
         case "-h", "--help":
             print("""
-            Usage: netskope-autofill.swift <sequence|step1|step2|dump|env> [--email1 E] [--email2 E]
+            Usage: netskope-autofill.swift <sequence|step1|step2|step3|dump|env> [--email1 E] [--email2 E] [--password P]
 
             Loads project-root .env:
               NETSKOPE_EMAIL   first page (Netskope)
               KKPS_EMAIL       second page (Microsoft / KKPS)
-              KKPS_PASSWORD    available to the script (not typed yet)
+              KKPS_PASSWORD    third page (password) — stored in plaintext .env; not committed (.gitignore)
             CLI flags override .env / environment.
+
+            step1 / sequence wait indefinitely for the Netskope window to appear before
+            typing, so you can start the script first and open Netskope afterward
+            (Ctrl+C to cancel).
             Command `env` only prints loaded values (no Accessibility needed).
             """)
             exit(0)
@@ -490,20 +635,33 @@ private func main() {
     if args.command != "env" {
         requireAccessibility()
     }
+    if ["step1", "step2", "step3", "sequence"].contains(args.command), !validateInputs(args) {
+        exit(1)
+    }
 
     let step1 = Step(
         name: "step1",
-        email: args.email1,
+        value: args.email1,
         buttonPattern: "continue",
         fieldX: 0.50, fieldY: 0.68,
         buttonX: 0.50, buttonY: 0.78
     )
     let step2 = Step(
         name: "step2",
-        email: args.email2,
+        value: args.email2,
         buttonPattern: nil,
         fieldX: 0.50, fieldY: 0.24,
         buttonX: 0.50, buttonY: 0.50
+    )
+    // Field/button fractions are an unverified approximation copied from step1's
+    // layout (same field-then-button shape) — only used as a last-resort click
+    // fallback; AX-based discovery is primary and doesn't depend on them.
+    let step3 = Step(
+        name: "step3",
+        value: args.password,
+        buttonPattern: "sign in",
+        fieldX: 0.50, fieldY: 0.68,
+        buttonX: 0.50, buttonY: 0.78
     )
 
     switch args.command {
@@ -512,14 +670,32 @@ private func main() {
         break
     case "dump":
         dumpAX()
-    case "step1":
-        runStep(step1)
-    case "step2":
-        runStep(step2)
-    case "sequence":
-        runSequence(step1: step1, step2: step2)
+    case "step1", "step2", "step3", "sequence":
+        runWithMenuBarIcon {
+            switch args.command {
+            case "step1":
+                waitForStep1(step1)
+            case "step2":
+                if !waitThenRunStep2(step2) {
+                    log("failed")
+                    return 1
+                }
+            case "step3":
+                if !waitThenRunStep3(step3) {
+                    log("failed")
+                    return 1
+                }
+            default:
+                if !runSequence(step1: step1, step2: step2, step3: step3) {
+                    log("failed")
+                    return 1
+                }
+            }
+            log("done")
+            return 0
+        }
     default:
-        log("unknown command: \(args.command) (use sequence|step1|step2|dump|env)")
+        log("unknown command: \(args.command) (use sequence|step1|step2|step3|dump|env)")
         exit(2)
     }
 
