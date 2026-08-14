@@ -36,6 +36,16 @@ private let idleSafetyPollSeconds: TimeInterval = 60
 /// After a wake, poll briefly while the re-auth webview finishes loading.
 private let activeBurstSeconds: TimeInterval = 20
 private let activePollInterval: TimeInterval = 0.5
+/// How long to wait after a reload for the webview to leave the error page.
+/// Measured on the timeout page: press → step 1 form back in ≈4s.
+private let errorPageSettleSeconds: TimeInterval = 12
+/// Reloads to try before assuming the tunnel itself is down.
+private let maxErrorPageReloads = 4
+/// Added per failed reload (attempt × this), so a flapping backend isn't hammered.
+private let errorPageRetryDelaySeconds: TimeInterval = 5
+/// Pause after `maxErrorPageReloads` failures — a timed-out re-auth usually means
+/// the tunnel is down, and no amount of reloading fixes that.
+private let errorPageBackoffSeconds: TimeInterval = 120
 
 private struct Step {
     let name: String
@@ -327,6 +337,10 @@ private func step1PageReady() -> Bool {
     guard let app = netskopeApp(), let window = focusedOrMainWindow(for: app) else {
         return false
     }
+    return step1PageReady(in: window)
+}
+
+private func step1PageReady(in window: AXUIElement) -> Bool {
     let hasField = findElement(window) { _, role in
         role == "AXTextField" || role == "AXTextArea"
     } != nil
@@ -341,14 +355,201 @@ private func step1PageReady() -> Bool {
     return hasContinue
 }
 
-/// Waits for the Microsoft page and runs step 2. Returns false (without typing
-/// anything) if the page never appeared — typing email2 into whatever page
-/// *is* showing after a timeout risks submitting it to the wrong form.
-private func waitThenRunStep2(_ step2: Step) -> Bool {
+// MARK: - Error page recovery
+
+/// Netskope's re-auth webview can land on an error page instead of the email
+/// form — most often after the tunnel drops:
+///
+///   AXWebArea desc="Sorry!"
+///     AXHeading title="Request Timed Out"
+///     AXHeading title="Please retry"
+///     AXHeading title="unkn - ERR_TIMEOUT"
+///
+/// That is the *entire* accessible page: no field, no Continue, and — unlike the
+/// variant this code originally assumed — no in-page "Refresh" button either. So
+/// page text is the only thing to key on, and the reload control lives in the
+/// window chrome rather than the document.
+private let errorPageTextMarkers = [
+    "request timed out",
+    "err_timeout",
+    "please retry",
+    "err_connection",
+    "err_internet_disconnected",
+    "err_name_not_resolved",
+]
+
+private func windowShowsErrorPage(_ window: AXUIElement) -> Bool {
+    findElement(window) { el, role in
+        // Netskope titles its whole error-page family "Sorry!".
+        if role == "AXWebArea" {
+            let desc = axString(el, kAXDescriptionAttribute as String).lowercased()
+            if desc.hasPrefix("sorry") { return true }
+        }
+        guard role == "AXHeading" || role == "AXStaticText" else { return false }
+        let text = (axString(el, kAXTitleAttribute as String) + " "
+            + axString(el, kAXValueAttribute as String)).lowercased()
+        return errorPageTextMarkers.contains { text.contains($0) }
+    } != nil
+}
+
+private func netskopeErrorPageVisible() -> Bool {
+    guard let app = netskopeApp(), let window = focusedOrMainWindow(for: app) else {
+        return false
+    }
+    // The real form wins: if step 1 is on screen there is nothing to recover from,
+    // and reloading would throw away a page we're about to fill.
+    if step1PageReady(in: window) { return false }
+    return windowShowsErrorPage(window)
+}
+
+/// Fraction of the window frame holding the reload button — last-resort click
+/// target if AX ever stops exposing the chrome buttons. Measured on the 451×603
+/// re-authenticate window: button centre ≈ (396, 30) from the window origin.
+private let reloadButtonFx: CGFloat = 0.876
+private let reloadButtonFy: CGFloat = 0.050
+
+/// Locate the webview's reload button in the window chrome.
+///
+/// It carries no title, no description and no help text — the only thing telling
+/// it apart from its neighbour is that the neighbour's AXHelp is "Close". Hence
+/// identification by elimination, over the window's **direct** children only:
+/// recursing would match the webview scroll bars' eight unlabeled
+/// increment/decrement AXButtons long before reaching the chrome.
+///
+/// Returns nil when the choice is ambiguous (zero or several unlabeled
+/// candidates) rather than guessing — pressing an unknown unlabeled button in a
+/// login window is not a risk worth taking; the caller falls back to position.
+private func reloadButton(in window: AXUIElement) -> AXUIElement? {
+    let buttons = axChildren(window).filter {
+        axString($0, kAXRoleAttribute as String) == "AXButton"
+    }
+    func label(_ el: AXUIElement) -> String {
+        (axString(el, kAXTitleAttribute as String) + " "
+            + axString(el, kAXDescriptionAttribute as String) + " "
+            + axString(el, kAXHelpAttribute as String)).lowercased()
+    }
+
+    // Prefer an explicit label on the chance a future build provides one.
+    if let labeled = buttons.first(where: {
+        let l = label($0)
+        return l.contains("refresh") || l.contains("reload")
+    }) {
+        return labeled
+    }
+
+    let candidates = buttons.filter { el in
+        let l = label(el)
+        return !l.contains("close") && !l.contains("minimi") && !l.contains("zoom")
+    }
+    guard candidates.count == 1 else {
+        log("error page: \(candidates.count) unlabeled chrome buttons — ambiguous")
+        return nil
+    }
+    return candidates[0]
+}
+
+private func pressReload(on window: AXUIElement, app: NSRunningApplication) {
+    focusWindow(window, app: app)
+    Thread.sleep(forTimeInterval: 0.4)
+
+    if let button = reloadButton(in: window) {
+        log("error page: AX pressing reload")
+        AXUIElementPerformAction(button, kAXPressAction as CFString)
+        return
+    }
+    log("error page: falling back to reload click position")
+    clickFraction(window: window, fx: reloadButtonFx, fy: reloadButtonFy)
+}
+
+/// Press reload, then wait for the webview to come back with the step 1 form.
+private func reloadErrorPageAndWait() -> Bool {
+    guard let app = netskopeApp(), let window = focusedOrMainWindow(for: app) else {
+        return false
+    }
+    pressReload(on: window, app: app)
+
+    let deadline = Date().addingTimeInterval(errorPageSettleSeconds)
+    while Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.5)
+        guard let window = focusedOrMainWindow(for: app) else { continue }
+        if step1PageReady(in: window) {
+            log("error page: reload recovered — step 1 form is back")
+            return true
+        }
+    }
+    log("error page: no step 1 form \(Int(errorPageSettleSeconds))s after reload")
+    return false
+}
+
+/// Bounded reload retries with backoff.
+///
+/// A timed-out re-auth usually means the tunnel is down, and reloading cannot fix
+/// that — so after `maxErrorPageReloads` failures this pauses rather than
+/// spinning on a page that will not recover until the network does.
+private final class ErrorPageRecovery {
+    static let shared = ErrorPageRecovery()
+
+    private var consecutiveReloads = 0
+
+    /// Returns true when the error page was seen and handled — the caller should
+    /// re-evaluate the window rather than fall through to its next check.
+    func attempt() -> Bool {
+        guard netskopeErrorPageVisible() else {
+            consecutiveReloads = 0
+            return false
+        }
+
+        guard consecutiveReloads < maxErrorPageReloads else {
+            log("error page: \(consecutiveReloads) reloads didn't help — pausing \(Int(errorPageBackoffSeconds))s")
+            Thread.sleep(forTimeInterval: errorPageBackoffSeconds)
+            consecutiveReloads = 0
+            return true
+        }
+
+        consecutiveReloads += 1
+        log("error page detected — reloading (attempt \(consecutiveReloads)/\(maxErrorPageReloads))")
+        if reloadErrorPageAndWait() {
+            consecutiveReloads = 0
+            return true
+        }
+        Thread.sleep(forTimeInterval: errorPageRetryDelaySeconds * Double(consecutiveReloads))
+        return true
+    }
+}
+
+private func tryRecoverFromNetskopeErrorPage() -> Bool {
+    ErrorPageRecovery.shared.attempt()
+}
+
+/// Waits for the Microsoft page and runs step 2. If Netskope shows its error
+/// page after Continue, reloads and retries step 1 (bounded). Returns false if
+/// Microsoft never appeared — never type email2 into an unknown page.
+private func waitThenRunStep2(step1: Step, step2: Step) -> Bool {
     var elapsed = 0.0
+    var step1Retries = 0
+    let maxStep1Retries = 3
+
     while elapsed < 20.0 {
         Thread.sleep(forTimeInterval: 0.3)
         elapsed += 0.3
+
+        if tryRecoverFromNetskopeErrorPage() {
+            // The reload restarts the flow at page 1, so re-enter the email —
+            // otherwise we'd sit here waiting for a Microsoft page that the
+            // recovered form has not been submitted to yet.
+            elapsed = 0
+            if step1Retries < maxStep1Retries, step1PageReady() {
+                step1Retries += 1
+                log("retrying step 1 after reload (attempt \(step1Retries)/\(maxStep1Retries))")
+                runStep(step1)
+                Thread.sleep(forTimeInterval: 1.5)
+            } else if step1Retries >= maxStep1Retries {
+                log("step 1 retry budget exhausted after error page — aborting step 2")
+                return false
+            }
+            continue
+        }
+
         if microsoftPageVisible() {
             log("Microsoft page detected after \(String(format: "%.1f", elapsed))s")
             Thread.sleep(forTimeInterval: 0.4)
@@ -388,6 +589,7 @@ private func waitForStep1(_ step1: Step) {
     let wake = NetskopeWakeSource.shared
 
     while true {
+        if tryRecoverFromNetskopeErrorPage() { continue }
         if tryRunStep1IfReady(step1) { return }
 
         // Log idle only when we actually block. A pending startup poke must not
@@ -400,6 +602,7 @@ private func waitForStep1(_ step1: Step) {
         if result.fromEvent {
             MenuBarStatus.shared.set(.watching)
         }
+        if tryRecoverFromNetskopeErrorPage() { continue }
         if tryRunStep1IfReady(step1) { return }
 
         guard result.fromEvent else { continue }
@@ -407,6 +610,7 @@ private func waitForStep1(_ step1: Step) {
         // Webview often populates after the window event — burst-poll briefly.
         let burstDeadline = Date().addingTimeInterval(activeBurstSeconds)
         while Date() < burstDeadline {
+            if tryRecoverFromNetskopeErrorPage() { continue }
             if tryRunStep1IfReady(step1) { return }
             Thread.sleep(forTimeInterval: activePollInterval)
         }
@@ -428,7 +632,7 @@ private func runSequenceOnce(step1: Step, step2: Step, step3: Step) -> Bool {
     waitForStep1(step1)
     MenuBarStatus.shared.set(.watching)
     Thread.sleep(forTimeInterval: 1.5)
-    guard waitThenRunStep2(step2) else { return false }
+    guard waitThenRunStep2(step1: step1, step2: step2) else { return false }
     return waitThenRunStep3(step3)
 }
 

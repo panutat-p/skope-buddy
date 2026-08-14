@@ -15,6 +15,7 @@ The current working tool ahead of the full app.
 - [x] Add step 3 (password page → type `CORPORATE_PASSWORD` → AXPress "Sign in"), gated by the same validate-before-type guard; abort (don't type blind) if the password page isn't detected within 20s
 - [x] Poll for the step 1 page instead of a one-shot check, so the script can be started *before* Netskope is open; waits indefinitely (Ctrl+C to cancel). Standalone `step2`/`step3` now also wait for their page instead of firing once.
 - [x] Make step 1 detection distinctive (require the "Continue" button **and** a text field, not just any field) so it can't false-match the Microsoft/password pages and type email1 into the wrong page if started mid-flow
+- [x] Recover from the re-auth webview's error pages ("Request Timed Out" / `ERR_TIMEOUT`) by pressing the window-chrome reload button, with bounded retries and backoff — see [error_page_recovery.md](error_page_recovery.md)
 - [ ] Re-find the "Continue" button inside the retry loop — the webview can re-render after typing, invalidating the `AXUIElement` captured before typing
 - [ ] Skip straight to the coordinate fallback when no button was found at all, instead of spinning through all 8 retry attempts
 - [ ] Propagate real exit codes for "Netskope Client not running" / "no Netskope window" cases in `runStep`
