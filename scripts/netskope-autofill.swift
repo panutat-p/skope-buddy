@@ -175,18 +175,52 @@ private func postKey(pid: pid_t, keyCode: CGKeyCode, flags: CGEventFlags = [], h
     }
 }
 
+/// Select the field's current contents via AX so a following insert replaces
+/// them. Returns false when the webview doesn't expose a writable range —
+/// caller falls back to Cmd+A.
+private func selectAllText(in field: AXUIElement) -> Bool {
+    let current = axString(field, kAXValueAttribute as String)
+    var range = CFRange(location: 0, length: (current as NSString).length)
+    guard let axRange = AXValueCreate(.cfRange, &range) else { return false }
+    return AXUIElementSetAttributeValue(
+        field, kAXSelectedTextRangeAttribute as CFString, axRange
+    ) == .success
+}
+
+/// `CGEventKeyboardSetUnicodeString` accepts at most 20 UTF-16 units per event.
+private let unicodeEventLimit = 20
+
+/// Insert `text` as unicode keyboard events targeted at `pid` — whole string
+/// per event, no per-character delay, clipboard untouched.
+///
+/// Unlike an AXValue write, this still fires the webview's input JS so
+/// Continue/Sign in can enable. Unlike Cmd+V, it never overwrites the user's
+/// pasteboard (save/restore still races with a copy in that window).
 private func typeText(_ text: String, to pid: pid_t) {
     let source = CGEventSource(stateID: .hidSystemState)
-    for scalar in text.unicodeScalars {
-        var chars = [UniChar](String(scalar).utf16)
+    let utf16 = Array(text.utf16)
+    var offset = 0
+    while offset < utf16.count {
+        let count = min(unicodeEventLimit, utf16.count - offset)
+        var chars = Array(utf16[offset..<(offset + count)])
         let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
         let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
         down?.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: &chars)
         up?.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: &chars)
         down?.postToPid(pid)
         up?.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.012)
+        offset += count
     }
+}
+
+/// Clear the focused field, then insert `text` as a whole string.
+private func fillText(_ text: String, into field: AXUIElement?, pid: pid_t) {
+    let selected = field.map { selectAllText(in: $0) } ?? false
+    if !selected {
+        postKey(pid: pid, keyCode: 0, flags: .maskCommand) // Cmd+A (virtual key 0 = 'a')
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    typeText(text, to: pid)
 }
 
 private func leftClick(at point: CGPoint) {
@@ -252,11 +286,8 @@ private func runStep(_ step: Step) {
 
     Thread.sleep(forTimeInterval: 0.4)
     let pid = app.processIdentifier
-    // Cmd+A (virtual key 0 = 'a')
-    postKey(pid: pid, keyCode: 0, flags: .maskCommand)
-    Thread.sleep(forTimeInterval: 0.05)
-    typeText(step.value, to: pid)
-    log("\(step.name): typed value")
+    fillText(step.value, into: field, pid: pid)
+    log("\(step.name): filled value")
 
     if step.useEnter {
         Thread.sleep(forTimeInterval: 0.6)
