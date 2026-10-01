@@ -164,10 +164,57 @@ private func windowFrame(_ window: AXUIElement) -> CGRect? {
     return CGRect(origin: position, size: size)
 }
 
-private func focusWindow(_ window: AXUIElement, app: NSRunningApplication) {
-    app.activate()
-    AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-    AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+private func applicationIsFrontmost(_ app: NSRunningApplication) -> Bool {
+    NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+}
+
+/// Bring a re-authenticate window forward even when it is buried under other apps.
+///
+/// On macOS 14 and later, `NSRunningApplication.activate()` does not take
+/// focus from the front app, so a Netskope sign-in window that is behind never
+/// becomes the typing target. Raising that window and then setting the app
+/// frontmost through Accessibility does.
+private func focusWindow(_ window: AXUIElement, app: NSRunningApplication) -> Bool {
+    let appElement = AXUIElementCreateApplication(app.processIdentifier)
+    if !applicationIsFrontmost(app) {
+        log("login window is behind; bringing it forward")
+    }
+
+    let deadline = Date().addingTimeInterval(1.5)
+    repeat {
+        if app.isHidden {
+            _ = app.unhide()
+        }
+        if axBool(window, kAXMinimizedAttribute as String) {
+            AXUIElementSetAttributeValue(
+                window,
+                kAXMinimizedAttribute as CFString,
+                kCFBooleanFalse
+            )
+        }
+        // Raise the login window before making the app frontmost. Setting
+        // frontmost alone leaves the current app in front.
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(
+            window,
+            kAXMainAttribute as CFString,
+            kCFBooleanTrue
+        )
+        AXUIElementSetAttributeValue(
+            window,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
+        AXUIElementSetAttributeValue(
+            appElement,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        Thread.sleep(forTimeInterval: 0.2)
+        if applicationIsFrontmost(app) { return true }
+    } while Date() < deadline
+
+    return false
 }
 
 // MARK: - Input (process-targeted)
@@ -269,7 +316,10 @@ private func runStep(_ step: Step) {
 
     let title = axString(window, kAXTitleAttribute as String)
     log("\(step.name): starting, window=\(title.isEmpty ? "(untitled)" : title)")
-    focusWindow(window, app: app)
+    guard focusWindow(window, app: app) else {
+        log("\(step.name): could not make Netskope Client frontmost; refusing to type")
+        return
+    }
     Thread.sleep(forTimeInterval: 0.4)
 
     let field = findElement(window) { _, role in
@@ -480,7 +530,10 @@ private func reloadButton(in window: AXUIElement) -> AXUIElement? {
 }
 
 private func pressReload(on window: AXUIElement, app: NSRunningApplication) {
-    focusWindow(window, app: app)
+    guard focusWindow(window, app: app) else {
+        log("error page: could not make Netskope Client frontmost; refusing to click")
+        return
+    }
     Thread.sleep(forTimeInterval: 0.4)
 
     if let button = reloadButton(in: window) {
